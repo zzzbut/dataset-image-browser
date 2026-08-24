@@ -125,6 +125,7 @@ class FileOpsModel:
                 with open(txt_path, "r", encoding="utf-8") as f:
                     if image_path in {line.strip() for line in f if line.strip()}:
                         marks.add(cat)
+        return marks
 
     @staticmethod
     def get_label_path(image_path: str, label_dir: str) -> str | None:
@@ -133,4 +134,3 @@ class FileOpsModel:
         img_name = Path(image_path).stem
         label_path = Path(label_dir) / f"{img_name}.txt"
         return str(label_path) if label_path.exists() else None
-        return marks
