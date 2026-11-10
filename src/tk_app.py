@@ -17,9 +17,9 @@ import traceback
 from collections import defaultdict, OrderedDict
 from logging.handlers import RotatingFileHandler
 
-VERSION = "v1.0.20"
+VERSION = "v1.0.21"
 AUTHOR = "zhw"
-UPDATE_DATE = "2026-07-09"
+UPDATE_DATE = "2026-11-10"
 
 # ============ 日志子系统 ============
 # 目的：打包后的 exe（windowed 模式无控制台）也能在 logs/ 目录留下运行日志，
@@ -3687,6 +3687,7 @@ class TkImageBrowser:
             "recursive": self.recursive.get(),
             "performance_mode": self.performance_mode.get(),
             "auto_shutdown": self.auto_shutdown.get(),
+            "dedupe_cache_enabled": self.dedupe_cache_var.get(),
             "tutorial_seen": self.config.get("tutorial_seen", False),
             "categories": self._categories(),
             "last_index": self.current_index,
@@ -3719,6 +3720,8 @@ class TkImageBrowser:
         self.keep_structure = BooleanVar(value=True)
         self.performance_mode = BooleanVar(value=bool(self.config.get("performance_mode", self.config.get("dedupe_performance_mode", False))))
         self.auto_shutdown = BooleanVar(value=False)
+        # 相似去重崩溃恢复缓存开关：默认关闭（单机使用最快），开启后中途崩溃/中断可恢复进度
+        self.dedupe_cache_var = BooleanVar(value=bool(self.config.get("dedupe_cache_enabled", False)))
         self._panels: dict[str, ttk.Frame] = {}
         self._nav_buttons: dict[str, ttk.Button] = {}
         self._module_logs: dict[str, list[str]] = {}
@@ -4573,6 +4576,14 @@ class TkImageBrowser:
         json_row.pack(fill="x", pady=(0, 6))
         ttk.Button(json_row, text="导出结果JSON", command=self.export_dedupe_results_json).pack(side="left", fill="x", expand=True)
         ttk.Button(json_row, text="导入结果JSON", command=self.import_dedupe_results_json).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        # 缓存开关：关闭时完全不创建缓存对象，扫描最快；开启后崩溃/中断可恢复进度
+        ttk.Checkbutton(
+            tab,
+            text="启用崩溃恢复缓存（中断/崩溃后可续扫，但扫描较慢）",
+            variable=self.dedupe_cache_var,
+            command=self._save_config,
+        ).pack(fill="x", pady=(0, 6))
 
         ttk.Separator(tab, orient="horizontal").pack(fill="x", pady=(2, 6))
 
@@ -6498,20 +6509,20 @@ class TkImageBrowser:
             self.notify_flow("[相似去重] 请选择扫描图片文件夹")
             messagebox.showwarning("提示", "请选择扫描图片文件夹")
             return
-        # 检测是否有上次未完成的缓存
-        cached = DedupeCache.load(folder)
-        if cached is not None and cached.features:
-            choice = self._ask_resume_choice(folder, cached)
-            if choice == "cancel":
-                return
-            if choice == "clear":
-                try:
-                    cached.clear()
-                except Exception:
-                    pass
+        # 检测是否有上次未完成的缓存（仅在启用崩溃恢复缓存时才弹窗）
+        if self.dedupe_cache_var.get():
+            cached = DedupeCache.load(folder)
+            if cached is not None and cached.features:
+                choice = self._ask_resume_choice(folder, cached)
+                if choice == "cancel":
+                    return
+                if choice == "clear":
+                    try:
+                        cached.clear()
+                    except Exception:
+                        pass
         if self._displayed_dedupe_task_id in (0, task_id):
-            for child in self.dedupe_result.inner.winfo_children():
-                child.destroy()
+            self.dedupe_canvas_view.set_message(f"任务{task_id}正在重新扫描...")
             self.thumb_refs.clear()
         phash = max(0, min(64, safe_int(phash_thresh, 9)))
         color = max(0.0, min(1.0, safe_float(color_thresh, 0.40)))
@@ -6595,30 +6606,32 @@ class TkImageBrowser:
             paths = [str(p) for p in root.rglob("*") if p.is_file() and is_image(p)]
             self.task_queue.put(("dedupe_status", (task_id, f"[扫描] 完成：发现 {len(paths)} 张图片")))
 
-            # 加载磁盘缓存
-            cache = DedupeCache.load(folder)
-            if cache is not None and cache.features:
-                # 校验配置是否一致，差异过大则不使用
-                if cache.algorithm != algorithm or cache.phash_thresh != phash_thresh or abs(cache.color_thresh - color_thresh) > 0.01:
-                    self.task_queue.put(("dedupe_status", (task_id, f"[缓存] 配置不一致（算法/阈值变化），忽略旧缓存，重新扫描")))
-                    cache = None
+            # 加载磁盘缓存（仅在用户启用崩溃恢复缓存时才创建，关闭时 cache 始终为 None，扫描最快）
+            cache: DedupeCache | None = None
+            if self.dedupe_cache_var.get():
+                cache = DedupeCache.load(folder)
+                if cache is not None and cache.features:
+                    # 校验配置是否一致，差异过大则不使用
+                    if cache.algorithm != algorithm or cache.phash_thresh != phash_thresh or abs(cache.color_thresh - color_thresh) > 0.01:
+                        self.task_queue.put(("dedupe_status", (task_id, f"[缓存] 配置不一致（算法/阈值变化），忽略旧缓存，重新扫描")))
+                        cache = None
+                    else:
+                        # 清理已经不存在的图片条目
+                        valid = set(paths)
+                        cache.remove_missing(valid)
+                        # 命中数（绝对路径匹配）
+                        abs_paths = {str(Path(p).resolve()) for p in paths}
+                        hit = sum(1 for p in abs_paths if cache.has(p))
+                        self.task_queue.put(("dedupe_status", (task_id, f"[缓存] 命中 {hit}/{len(paths)} 张已抽取特征，继续扫描剩余 {len(paths) - hit} 张")))
+                        # 进度条快速补到 30%，给用户"在跑"的感觉
+                        if len(paths) > 0:
+                            self.task_queue.put(("dedupe_progress", (task_id, min(30.0, hit / max(len(paths), 1) * 30))))
                 else:
-                    # 清理已经不存在的图片条目
-                    valid = set(paths)
-                    cache.remove_missing(valid)
-                    # 命中数（绝对路径匹配）
-                    abs_paths = {str(Path(p).resolve()) for p in paths}
-                    hit = sum(1 for p in abs_paths if cache.has(p))
-                    self.task_queue.put(("dedupe_status", (task_id, f"[缓存] 命中 {hit}/{len(paths)} 张已抽取特征，继续扫描剩余 {len(paths) - hit} 张")))
-                    # 进度条快速补到 30%，给用户"在跑"的感觉
-                    if len(paths) > 0:
-                        self.task_queue.put(("dedupe_progress", (task_id, min(30.0, hit / max(len(paths), 1) * 30))))
-            else:
-                # 新建一个空的缓存
-                cache = DedupeCache(folder, algorithm, phash_thresh, color_thresh)
-            # 把当前缓存注册到全局列表（异常兜底时统一刷盘）
-            if cache is not None and cache not in TkImageBrowser._active_caches:
-                TkImageBrowser._active_caches.append(cache)
+                    # 新建一个空的缓存
+                    cache = DedupeCache(folder, algorithm, phash_thresh, color_thresh)
+                # 把当前缓存注册到全局列表（异常兜底时统一刷盘）
+                if cache is not None and cache not in TkImageBrowser._active_caches:
+                    TkImageBrowser._active_caches.append(cache)
 
             def feature(path: str) -> ImageFeature | None:
                 if stop_event.is_set():
@@ -6819,26 +6832,7 @@ class TkImageBrowser:
             self._show_center_view("dedupe")
         self._run_thread(self._prepare_dedupe_thumbnails_worker, task_id, groups)
         return
-        self._dedupe_pending_groups = groups
-        self.dedupe_groups = groups
-        self.dedupe_selected.clear()
-        self.thumb_refs.clear()
-        for child in self.dedupe_result.inner.winfo_children():
-            child.destroy()
-        if not groups:
-            ttk.Label(self.dedupe_result.inner, text="未发现相似图片").pack(anchor="w")
-            self._show_center_view("dedupe")
-            self._dedupe_summary_var.set("相似去重：未发现相似图片")
-            self._dedupe_current_var.set("")
-            self.dedupe_canvas_view.set_message("未发现相似图片")
-            return
-        total_images = sum(len(group) for group in groups)
-        self._show_center_view("dedupe")
-        self._dedupe_cache_status_var.set(f"正在缓存缩略图：0/{total_images}")
-        self._dedupe_summary_var.set(f"相似去重：正在缓存缩略图 0/{total_images}")
-        self._dedupe_current_var.set("")
-        self.dedupe_status_var.set(f"[相似去重] 正在缓存缩略图 0/{total_images}")
-        self._run_thread(self._prepare_dedupe_thumbnails_worker, groups)
+
 
     def _prepare_dedupe_thumbnails_worker(self, task_id: int, groups: list[list[str]]) -> None:
         thumb_map: dict[str, Image.Image | None] = {}
@@ -6979,7 +6973,6 @@ class TkImageBrowser:
         self.dedupe_status_var.set(f"[相似去重] 已加载 {len(all_paths)} 张图片到图像查看区")
         self.image_info_var.set(f"相似去重结果：{len(groups)} 组，{len(all_paths)} 张图片")
 
-        ttk.Label(self.dedupe_result.inner, text=f"结果已显示在中间图像区域：{len(groups)} 组，{len(all_paths)} 张").pack(anchor="w")
         for group in groups:
             for path in group:
                 var = BooleanVar(value=False)
@@ -7007,14 +7000,10 @@ class TkImageBrowser:
         self.image_paths = image_paths
         self.current_index = 0 if self.image_paths else -1
         self._show_center_view("dedupe")
-        for child in self.dedupe_result.inner.winfo_children():
-            child.destroy()
         if groups:
-            ttk.Label(self.dedupe_result.inner, text=f"当前显示任务{task_id}：{len(groups)} 组，{len(image_paths)} 张").pack(anchor="w")
             self.dedupe_canvas_view.raw_thumb_map = dict(state.get("raw_thumb_map", {}))
             self.dedupe_canvas_view.set_groups(groups, thumb_map, self.dedupe_selected)
         else:
-            ttk.Label(self.dedupe_result.inner, text=f"任务{task_id}未发现相似图片").pack(anchor="w")
             self.dedupe_canvas_view.set_message(f"任务{task_id}未发现相似图片")
         self.image_info_var.set(f"任务{task_id} 相似去重结果：{len(groups)} 组，{len(image_paths)} 张图片")
         self._refresh_dedupe_summary()

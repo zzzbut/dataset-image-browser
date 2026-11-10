@@ -6,6 +6,26 @@
 
 ---
 
+## v1.0.21
+
+**日期**：2026-11-10
+**作者**：zhw
+
+### 修改内容
+
+- **相似去重新增"崩溃恢复缓存"开关**
+  - 去重面板新增勾选框，默认关闭：单机使用时完全不创建 `DedupeCache`，跳过特征缓存读写与周期落盘，扫描最快
+  - 开启后行为与旧版一致：每 200 张 / 60 秒异步落盘 `.dedupe_cache.json`，任务中断或崩溃后可续扫
+  - 开关状态持久化到配置（`dedupe_cache_enabled`），仅在开启时才弹"续扫/重扫/取消"对话框
+- **相似去重结果展示清理**
+  - 重扫/展示统一走中间画布视图（`dedupe_canvas_view`），删除旧滚动面板残留代码与死代码
+- **打包修复（build.py）**
+  - 收缩 `--exclude-module` 列表：urllib/email/asyncio、tkinter.dialog、MpoImagePlugin 等被延迟 import 依赖的模块不再排除，避免启动期 `ModuleNotFoundError`
+  - PyInstaller 子进程固定 PATH 与 `TCL_LIBRARY`/`TK_LIBRARY` 指向当前环境的 tcl8.6/tk8.6，修复 conda 多环境 tcl/tk 版本不一致导致的 `TclError: version conflict for package "Tcl"`
+  - 移除未使用的 `appdirs`（requirements.txt 与 hidden-imports 同步清理）
+
+---
+
 ## v1.0.10
 
 **日期**：2026-07-01

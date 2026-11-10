@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,30 +19,20 @@ def _get_version() -> str:
 
 
 # 不需要的标准库模块（减小体积）
+# 注意：网络/邮件/解析类 stdlib 模块 (urllib/email/http/html/xml/asyncio 等) 虽然体积
+# 较大，但被 PyInstaller 运行时钩子或保留的第三方库间接引用，必须保留，否则会出现
+# 启动期 ModuleNotFoundError。例如：
+#   - pyi_rth_inspect -> inspect -> zipfile -> pathlib -> urllib.parse
+#   - pyi_rth_pkgres  -> pkg_resources -> email
+#   - PIL -> xml ; numpy -> asyncio/doctest/pydoc/unittest (numpy.testing)
+# 因此只排除明确的测试/废弃/平台无关模块。
 EXCLUDE_STDLIB = [
-    "--exclude-module=unittest",
     "--exclude-module=test",
     "--exclude-module=tests",
     "--exclude-module=xmlrpc",
-    "--exclude-module=pydoc",
-    "--exclude-module=doctest",
     "--exclude-module=lib2to3",
     "--exclude-module=curses",
     "--exclude-module=msilib",
-    "--exclude-module=asyncio",
-    "--exclude-module=email",
-    "--exclude-module=http",
-    "--exclude-module=urllib",
-    "--exclude-module=ftplib",
-    "--exclude-module=smtplib",
-    "--exclude-module=imaplib",
-    "--exclude-module=nntplib",
-    "--exclude-module=telnetlib",
-    "--exclude-module=html",
-    "--exclude-module=xml",
-    "--exclude-module=xml.dom",
-    "--exclude-module=xml.sax",
-    "--exclude-module=pydoc",
 ]
 
 # 不需要的第三方库
@@ -63,56 +54,20 @@ EXCLUDE_THIRDPARTY = [
 ]
 
 # 不需要的 tkinter 子模块
+# 注意：tkinter 子模块间存在依赖（如 filedialog -> dialog），且体积都很小，
+# 因此只排除明确不会被运行时引用的 test 和已废弃的 tix。
 EXCLUDE_TKINTER = [
     "--exclude-module=tkinter.test",
     "--exclude-module=tkinter.tix",
-    "--exclude-module=tkinter.colorchooser",
-    "--exclude-module=tkinter.dialog",
-    "--exclude-module=tkinter.dnd",
-    "--exclude-module=tkinter.scrolledtext",
 ]
 
-# 不需要的 PIL 图像格式插件（项目仅支持 jpg/png/bmp/webp/tif）
-EXCLUDE_PIL_PLUGINS = [
-    "--exclude-module=PIL.MpegImagePlugin",
-    "--exclude-module=PIL.SgiImagePlugin",
-    "--exclude-module=PIL.FpxImagePlugin",
-    "--exclude-module=PIL.MicImagePlugin",
-    "--exclude-module=PIL.SpiderImagePlugin",
-    "--exclude-module=PIL.XVThumbImagePlugin",
-    "--exclude-module=PIL.BlpImagePlugin",
-    "--exclude-module=PIL.BufrStubImagePlugin",
-    "--exclude-module=PIL.DcxImagePlugin",
-    "--exclude-module=PIL.EpsImagePlugin",
-    "--exclude-module=PIL.GbrImagePlugin",
-    "--exclude-module=PIL.GribStubImagePlugin",
-    "--exclude-module=PIL.Hdf5StubImagePlugin",
-    "--exclude-module=PIL.IcnsImagePlugin",
-    "--exclude-module=PIL.ImImagePlugin",
-    "--exclude-module=PIL.ImtImagePlugin",
-    "--exclude-module=PIL.IptcImagePlugin",
-    "--exclude-module=PIL.Jpeg2KImagePlugin",
-    "--exclude-module=PIL.McIdasImagePlugin",
-    "--exclude-module=PIL.MpoImagePlugin",
-    "--exclude-module=PIL.PalmImagePlugin",
-    "--exclude-module=PIL.PcdImagePlugin",
-    "--exclude-module=PIL.PcxImagePlugin",
-    "--exclude-module=PIL.PdfImagePlugin",
-    "--exclude-module=PIL.PixarImagePlugin",
-    "--exclude-module=PIL.PsdImagePlugin",
-    "--exclude-module=PIL.SunImagePlugin",
-    "--exclude-module=PIL.TgaImagePlugin",
-    "--exclude-module=PIL.WmfImagePlugin",
-    "--exclude-module=PIL.XbmImagePlugin",
-    "--exclude-module=PIL.XpmImagePlugin",
-    "--exclude-module=PIL.ImageCms",
-    "--exclude-module=PIL.ImageFilter",
-    "--exclude-module=PIL.ImageGrab",
-    "--exclude-module=PIL.ImageQt",
-    "--exclude-module=PIL.ImageWin",
-    "--exclude-module=PIL.ImageStat",
-    "--exclude-module=PIL.ImageSequence",
-]
+# PIL 子模块不排除：plugin 与功能模块间存在大量 import 依赖，例如
+#   PngImagePlugin  -> ImageSequence (顶层 import，项目打开 png 必触发)
+#   JpegImagePlugin -> MpoImagePlugin (顶层 import，项目打开 jpg 必触发)
+#   Image.py        -> ImageCms (函数内延迟 import，ICC 色彩转换触发)
+#   ImageEnhance    -> ImageStat ; PSDraw -> EpsImagePlugin (PIL hook 可能收集)
+# 各模块体积都很小，逐个排除风险高，故全部保留。
+EXCLUDE_PIL_PLUGINS = []
 
 # 实际需要的隐式导入
 HIDDEN_IMPORTS = [
@@ -126,9 +81,6 @@ HIDDEN_IMPORTS = [
     "--hidden-import=numpy.core",
     "--hidden-import=numpy.core._multiarray_umath",
     "--hidden-import=decord",
-    "--hidden-import=appdirs",
-    "--hidden-import=pkg_resources.extern.appdirs",
-    "--hidden-import=pkg_resources._vendor.appdirs",
 ]
 
 # 需要收集全部文件的包（含编译扩展和原生库）
@@ -220,7 +172,27 @@ def build(console: bool = False, onefile: bool = True) -> None:
     print(f"Building (CPU only) on {sys.platform} [{mode}, {bundle_mode}]...")
     print(" ".join(cmd[:12]) + " ...")
 
-    result = subprocess.run(cmd, capture_output=False)
+    # 限定 PyInstaller 子进程的原生库搜索路径优先当前 Python 环境，避免从 conda base /
+    # 系统 PATH 收集到其他版本的 tcl/tk（conda 多环境版本不一致会导致打包后启动期
+    # TclError: version conflict for package "Tcl"）。同时显式固定 TCL_LIBRARY/TK_LIBRARY
+    # 指向当前环境的 tcl8.6/tk8.6 数据目录，确保 hook 收集的是匹配版本。
+    py_prefix = Path(sys.executable).resolve().parent
+    extra_paths = [
+        str(py_prefix / "Library" / "bin"),
+        str(py_prefix / "DLLs"),
+        str(py_prefix / "Library" / "lib"),
+        str(py_prefix),
+    ]
+    child_env = os.environ.copy()
+    child_env["PATH"] = os.pathsep.join([*extra_paths, child_env.get("PATH", "")])
+    tcl_lib = py_prefix / "Library" / "lib" / "tcl8.6"
+    tk_lib = py_prefix / "Library" / "lib" / "tk8.6"
+    if tcl_lib.is_dir():
+        child_env["TCL_LIBRARY"] = str(tcl_lib)
+    if tk_lib.is_dir():
+        child_env["TK_LIBRARY"] = str(tk_lib)
+
+    result = subprocess.run(cmd, capture_output=False, env=child_env)
     if result.returncode != 0:
         print("\nBuild failed!")
         sys.exit(1)
